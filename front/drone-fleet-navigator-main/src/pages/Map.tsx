@@ -1,4 +1,5 @@
 import { motion } from "framer-motion";
+import SimpleMap from "@/components/map/SimpleMap";
 
 export default function Map() {
   return (
@@ -14,12 +15,8 @@ export default function Map() {
             Real-time tracking of drone positions and delivery routes
           </p>
         </div>
-        
-        <div className="bg-card border border-border rounded-lg p-8 text-center">
-          <div className="text-muted-foreground">
-            Map view will be implemented here
-          </div>
-        </div>
+
+        <SimpleMap />
       </motion.div>
     </div>
   );

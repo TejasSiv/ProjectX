@@ -85,11 +85,32 @@ uvicorn delivery_planner.main:app --reload
 - **Routing**: React Router with pages for Orders, Map, and Logs
 - **UI Components**: Atomic design with reusable components in `components/ui/`
 
-### Key Integration Points
-- **Database**: Supabase PostgreSQL with real-time subscriptions
-- **Real-time Updates**: Frontend polls orders every 5 seconds via `useOrders` hook
+### Backend-Frontend Integration
+- **Primary Data Flow**: Supabase PostgreSQL with real-time subscriptions for instant UI updates
+- **Secondary API**: FastAPI backend provides mission control and advanced order processing
+- **Dual Architecture**: System works with database-only mode (frontend + Supabase) or full-stack mode (frontend + backend + Supabase)
+- **Real-time Updates**: Frontend polls orders every 5 seconds via `useOrders` hook + Supabase real-time subscriptions
 - **Mission Execution**: Backend interfaces with PX4 SITL via MAVSDK for drone simulation
-- **API Communication**: Frontend communicates with FastAPI backend (when available)
+- **Error Handling**: Frontend gracefully falls back to database-only mode if backend is unavailable
+
+#### API Endpoints Integration
+- **Base URL**: `http://localhost:8000` (FastAPI development server)
+- **Orders API**: `/api/v1/orders` - CRUD operations for order management
+- **CORS Configuration**: Backend allows requests from frontend port 8080
+- **Request Format**: JSON with proper Content-Type headers
+- **Authentication**: Currently using Supabase auth (backend integration pending)
+
+#### Data Synchronization Strategy
+1. **Create Operations**: Frontend → Backend API → Database → Real-time sync to UI
+2. **Read Operations**: Frontend → Supabase direct query + 5-second polling
+3. **Update Operations**: Backend scheduler → Database → Real-time sync to UI  
+4. **Mission Updates**: MAVSDK → Backend → Database → Real-time sync to UI
+
+#### Integration Files
+- `front/drone-fleet-navigator-main/src/hooks/useBackendAPI.ts` - Backend API communication hook
+- `front/drone-fleet-navigator-main/src/hooks/useOrders.ts` - Primary data fetching with fallback logic
+- `backend/src/delivery_planner/main.py` - CORS and API endpoint configuration
+- `backend/src/delivery_planner/api/v1/orders.py` - Order management endpoints
 
 ## Development Patterns
 
@@ -123,9 +144,28 @@ uvicorn delivery_planner.main:app --reload
 - `docs/startupguide.md` - Detailed architectural documentation
 
 ## Environment Setup
-- Frontend uses Vite with environment variables (VITE_*)
-- Backend uses environment files in `.env/` directory
-- Supabase credentials are currently hardcoded in client.ts (should be moved to env vars for production)
+
+### Frontend Environment Variables (Vite)
+```bash
+# Frontend: front/drone-fleet-navigator-main/.env
+VITE_API_BASE_URL=http://localhost:8000    # FastAPI backend URL
+VITE_SUPABASE_URL=your_supabase_url        # Supabase project URL
+VITE_SUPABASE_ANON_KEY=your_anon_key       # Supabase anonymous key
+```
+
+### Backend Environment Configuration
+```bash
+# Backend: backend/.env (when available)
+DATABASE_URL=postgresql://username:password@localhost:5432/dbname
+CORS_ORIGINS=["http://localhost:8080"]     # Frontend development server
+API_PREFIX=/api/v1                         # API route prefix
+DEBUG=true                                 # Development mode
+```
+
+### Integration Notes
+- Supabase credentials are currently hardcoded in `client.ts` (should be moved to env vars for production)
+- Backend CORS is configured to allow frontend development server (port 8080)
+- Frontend gracefully handles backend unavailability by falling back to Supabase-only mode
 - PX4 SITL configuration for home coordinates and simulation parameters
 
 ## Testing Strategy
