@@ -1,115 +1,198 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useState, useEffect, useRef } from 'react';
 
-// Backend API configuration
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws/telemetry";
+// Types matching backend models
+interface DeliveryOrder {
+  id: string;
+  customer_id: string;
+  pickup_coordinates: { lat: number; lng: number };
+  dropoff_coordinates: { lat: number; lng: number };
+  status: 'pending' | 'scheduled' | 'in_flight' | 'completed' | 'failed';
+  priority: 'low' | 'medium' | 'high';
+  estimated_time?: number;
+  created_at: string;
+  updated_at: string;
+}
 
-// API client
-class BackendAPI {
+interface CreateOrderRequest {
+  customer_id: string;
+  pickup_coordinates: { lat: number; lng: number };
+  dropoff_coordinates: { lat: number; lng: number };
+  priority: 'low' | 'medium' | 'high';
+  package_weight?: number;
+  special_instructions?: string;
+}
+
+interface TelemetryData {
+  drone_id: string;
+  position: {
+    lat: number;
+    lng: number;
+    altitude: number;
+    heading: number;
+  };
+  status: {
+    is_armed: boolean;
+    is_flying: boolean;
+    battery_remaining: number;
+    gps_signal_strength: number;
+    speed: number;
+  };
+  mission_id?: string;
+  timestamp: string;
+}
+
+class BackendAPIClient {
   private baseURL: string;
+  private wsURL: string;
+  private ws: WebSocket | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
 
-  constructor(baseURL: string) {
-    this.baseURL = baseURL;
+  constructor() {
+    this.baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+    this.wsURL = import.meta.env.VITE_API_WS_URL || 'ws://localhost:8000';
   }
 
-  async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<T> {
     const url = `${this.baseURL}${endpoint}`;
     
     const response = await fetch(url, {
       headers: {
-        "Content-Type": "application/json",
+        'Content-Type': 'application/json',
         ...options.headers,
       },
       ...options,
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: "Unknown error" }));
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.detail || `HTTP ${response.status}: ${response.statusText}`);
     }
 
     return response.json();
   }
 
-  // Order endpoints
-  async getOrders(params?: {
-    status_filter?: string;
-    customer_id?: string;
-    page?: number;
-    size?: number;
-  }) {
-    const searchParams = new URLSearchParams();
-    if (params?.status_filter) searchParams.set("status_filter", params.status_filter);
-    if (params?.customer_id) searchParams.set("customer_id", params.customer_id);
-    if (params?.page) searchParams.set("page", params.page.toString());
-    if (params?.size) searchParams.set("size", params.size.toString());
-
-    const query = searchParams.toString();
-    return this.request(`/api/v1/orders${query ? `?${query}` : ""}`);
+  // Order Management
+  async getOrders(status?: string): Promise<DeliveryOrder[]> {
+    const params = status ? `?status=${status}` : '';
+    return this.request<DeliveryOrder[]>(`/api/v1/orders${params}`);
   }
 
-  async getOrder(orderId: string) {
-    return this.request(`/api/v1/orders/${orderId}`);
-  }
-
-  async createOrder(orderData: {
-    customer_id: string;
-    pickup_coords: [number, number];
-    dropoff_coords: [number, number];
-  }) {
-    return this.request("/api/v1/orders", {
-      method: "POST",
-      body: JSON.stringify(orderData),
+  async createOrder(order: CreateOrderRequest): Promise<DeliveryOrder> {
+    return this.request<DeliveryOrder>('/api/v1/orders', {
+      method: 'POST',
+      body: JSON.stringify(order),
     });
   }
 
-  async updateOrder(orderId: string, updates: any) {
-    return this.request(`/api/v1/orders/${orderId}`, {
-      method: "PUT",
+  async updateOrder(id: string, updates: Partial<DeliveryOrder>): Promise<DeliveryOrder> {
+    return this.request<DeliveryOrder>(`/api/v1/orders/${id}`, {
+      method: 'PUT',
       body: JSON.stringify(updates),
     });
   }
 
-  async updateOrderStatus(orderId: string, status: string) {
-    return this.request(`/api/v1/orders/${orderId}/status`, {
-      method: "PATCH",
-      body: JSON.stringify({ status }),
+  async deleteOrder(id: string): Promise<void> {
+    return this.request<void>(`/api/v1/orders/${id}`, {
+      method: 'DELETE',
     });
   }
 
-  async deleteOrder(orderId: string) {
-    return this.request(`/api/v1/orders/${orderId}`, {
-      method: "DELETE",
+  async startOrder(id: string): Promise<DeliveryOrder> {
+    return this.request<DeliveryOrder>(`/api/v1/orders/${id}/start`, {
+      method: 'POST',
     });
   }
 
-  // Health endpoint
-  async getHealth() {
-    return this.request("/health");
+  async abortOrder(id: string, reason?: string): Promise<DeliveryOrder> {
+    const params = reason ? `?reason=${encodeURIComponent(reason)}` : '';
+    return this.request<DeliveryOrder>(`/api/v1/orders/${id}/abort${params}`, {
+      method: 'POST',
+    });
+  }
+
+  // Telemetry & Health
+  async getCurrentTelemetry(): Promise<TelemetryData> {
+    return this.request<TelemetryData>('/api/v1/telemetry/current');
+  }
+
+  async getSystemHealth(): Promise<any> {
+    return this.request<any>('/health');
+  }
+
+  // WebSocket Connection
+  connectWebSocket(onMessage: (data: any) => void, onError?: (error: Event) => void): WebSocket {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      return this.ws;
+    }
+
+    const wsUrl = `${this.wsURL}/api/v1/telemetry/ws`;
+    this.ws = new WebSocket(wsUrl);
+
+    this.ws.onopen = () => {
+      console.log('WebSocket connected');
+      this.reconnectAttempts = 0;
+      
+      // Subscribe to all topics
+      this.ws?.send(JSON.stringify({
+        type: 'subscribe',
+        topics: ['telemetry', 'orders', 'missions', 'alerts']
+      }));
+    };
+
+    this.ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        onMessage(data);
+      } catch (error) {
+        console.error('Failed to parse WebSocket message:', error);
+      }
+    };
+
+    this.ws.onclose = () => {
+      console.log('WebSocket disconnected');
+      this.ws = null;
+      
+      // Auto-reconnect with exponential backoff
+      if (this.reconnectAttempts < this.maxReconnectAttempts) {
+        const delay = Math.pow(2, this.reconnectAttempts) * 1000;
+        setTimeout(() => {
+          this.reconnectAttempts++;
+          this.connectWebSocket(onMessage, onError);
+        }, delay);
+      }
+    };
+
+    this.ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      onError?.(error);
+    };
+
+    return this.ws;
+  }
+
+  disconnectWebSocket(): void {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
   }
 }
 
-export const backendAPI = new BackendAPI(API_BASE_URL);
+const apiClient = new BackendAPIClient();
 
-// React Query hooks for backend API
-export function useBackendOrders(params?: {
-  status_filter?: string;
-  customer_id?: string;
-  page?: number;
-  size?: number;
-}) {
+// React Query Hooks
+export function useBackendOrders(status?: string) {
   return useQuery({
-    queryKey: ["backend-orders", params],
-    queryFn: () => backendAPI.getOrders(params),
-    refetchInterval: 10000, // Poll every 10 seconds
-  });
-}
-
-export function useBackendOrder(orderId: string) {
-  return useQuery({
-    queryKey: ["backend-order", orderId],
-    queryFn: () => backendAPI.getOrder(orderId),
-    enabled: !!orderId,
+    queryKey: ['backend-orders', status],
+    queryFn: () => apiClient.getOrders(status),
+    refetchInterval: 5000, // Poll every 5 seconds
+    staleTime: 0, // Always refetch
+    retry: 2,
   });
 }
 
@@ -117,10 +200,11 @@ export function useCreateOrder() {
   const queryClient = useQueryClient();
   
   return useMutation({
-    mutationFn: backendAPI.createOrder.bind(backendAPI),
+    mutationFn: (order: CreateOrderRequest) => apiClient.createOrder(order),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["backend-orders"] });
-      queryClient.invalidateQueries({ queryKey: ["orders"] }); // Also invalidate Supabase orders
+      // Invalidate orders cache
+      queryClient.invalidateQueries({ queryKey: ['backend-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
     },
   });
 }
@@ -129,83 +213,137 @@ export function useUpdateOrder() {
   const queryClient = useQueryClient();
   
   return useMutation({
-    mutationFn: ({ orderId, updates }: { orderId: string; updates: any }) =>
-      backendAPI.updateOrder(orderId, updates),
+    mutationFn: ({ id, updates }: { id: string; updates: Partial<DeliveryOrder> }) =>
+      apiClient.updateOrder(id, updates),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["backend-orders"] });
-      queryClient.invalidateQueries({ queryKey: ["orders"] });
+      queryClient.invalidateQueries({ queryKey: ['backend-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
     },
   });
 }
 
-export function useUpdateOrderStatus() {
+export function useDeleteOrder() {
   const queryClient = useQueryClient();
   
   return useMutation({
-    mutationFn: ({ orderId, status }: { orderId: string; status: string }) =>
-      backendAPI.updateOrderStatus(orderId, status),
+    mutationFn: (id: string) => apiClient.deleteOrder(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["backend-orders"] });
-      queryClient.invalidateQueries({ queryKey: ["orders"] });
+      queryClient.invalidateQueries({ queryKey: ['backend-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
     },
   });
 }
 
-export function useBackendHealth() {
-  return useQuery({
-    queryKey: ["backend-health"],
-    queryFn: () => backendAPI.getHealth(),
-    refetchInterval: 30000, // Check every 30 seconds
+export function useStartOrder() {
+  const queryClient = useQueryClient();
+  
+  return useMutation({
+    mutationFn: (id: string) => apiClient.startOrder(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['backend-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+    },
   });
 }
 
-// WebSocket hook for real-time telemetry
-export function useWebSocketTelemetry(
-  onTelemetry?: (data: any) => void,
-  onStatusUpdate?: (data: any) => void
-) {
+export function useAbortOrder() {
+  const queryClient = useQueryClient();
+  
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason?: string }) =>
+      apiClient.abortOrder(id, reason),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['backend-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+    },
+  });
+}
+
+export function useTelemetry() {
+  return useQuery({
+    queryKey: ['telemetry'],
+    queryFn: () => apiClient.getCurrentTelemetry(),
+    refetchInterval: 2000, // Poll every 2 seconds
+    retry: 3,
+  });
+}
+
+export function useSystemHealth() {
+  return useQuery({
+    queryKey: ['health'],
+    queryFn: () => apiClient.getSystemHealth(),
+    refetchInterval: 10000, // Poll every 10 seconds
+  });
+}
+
+// Real-time WebSocket Hook
+export function useWebSocket() {
+  const [isConnected, setIsConnected] = useState(false);
+  const [lastMessage, setLastMessage] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const queryClient = useQueryClient();
 
-  return useQuery({
-    queryKey: ["websocket-telemetry"],
-    queryFn: () => {
-      return new Promise((resolve, reject) => {
-        const ws = new WebSocket(WS_URL);
+  useEffect(() => {
+    const handleMessage = (data: any) => {
+      setLastMessage(data);
+      setError(null);
 
-        ws.onopen = () => {
-          console.log("Connected to telemetry WebSocket");
-          resolve(ws);
-        };
+      // Handle different message types
+      switch (data.type) {
+        case 'telemetry':
+          queryClient.setQueryData(['telemetry'], data.payload);
+          break;
+        case 'order_update':
+          queryClient.invalidateQueries({ queryKey: ['backend-orders'] });
+          queryClient.invalidateQueries({ queryKey: ['orders'] });
+          break;
+        case 'mission_update':
+          queryClient.invalidateQueries({ queryKey: ['missions'] });
+          break;
+        case 'alert':
+          // Handle alerts/notifications
+          console.log('System alert:', data.payload);
+          break;
+      }
+    };
 
-        ws.onmessage = (event) => {
-          try {
-            const message = JSON.parse(event.data);
-            
-            if (message.type === "telemetry" && onTelemetry) {
-              onTelemetry(message.data);
-            } else if (message.type === "status_update" && onStatusUpdate) {
-              onStatusUpdate(message.data);
-              // Invalidate orders when status updates
-              queryClient.invalidateQueries({ queryKey: ["orders"] });
-              queryClient.invalidateQueries({ queryKey: ["backend-orders"] });
-            }
-          } catch (error) {
-            console.error("Error parsing WebSocket message:", error);
-          }
-        };
+    const handleError = (error: Event) => {
+      setError('WebSocket connection error');
+      setIsConnected(false);
+    };
 
-        ws.onerror = (error) => {
-          console.error("WebSocket error:", error);
-          reject(error);
-        };
+    wsRef.current = apiClient.connectWebSocket(handleMessage, handleError);
+    
+    const checkConnection = () => {
+      setIsConnected(wsRef.current?.readyState === WebSocket.OPEN);
+    };
 
-        ws.onclose = () => {
-          console.log("WebSocket connection closed");
-        };
-      });
-    },
-    enabled: true,
-    retry: true,
-    refetchInterval: false,
-  });
+    const interval = setInterval(checkConnection, 1000);
+
+    return () => {
+      clearInterval(interval);
+      apiClient.disconnectWebSocket();
+    };
+  }, [queryClient]);
+
+  return {
+    isConnected,
+    lastMessage,
+    error,
+    reconnect: () => {
+      apiClient.disconnectWebSocket();
+      wsRef.current = apiClient.connectWebSocket(
+        (data) => setLastMessage(data),
+        (error) => setError('Connection error')
+      );
+    }
+  };
 }
+
+export { apiClient };
+
+// Legacy exports for backward compatibility
+export const backendAPI = apiClient;
+export const useBackendHealth = useSystemHealth;
+export const useWebSocketTelemetry = useWebSocket;

@@ -10,6 +10,17 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
+    <!-- Preload Leaflet resources for faster map loading -->
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com">
+    <link rel="preconnect" href="https://a.tile.openstreetmap.org">
+    <link rel="preconnect" href="https://b.tile.openstreetmap.org">
+    <link rel="preconnect" href="https://c.tile.openstreetmap.org">
+    <link rel="dns-prefetch" href="https://raw.githubusercontent.com">
+    
+    <!-- Preload Leaflet CSS -->
+    <link rel="preload" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/leaflet.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+    <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/leaflet.css"></noscript>
+
     <meta property="og:title" content="e5bcfd55-18ac-44e4-8ac8-44ba509abdb3" />
     <meta property="og:description" content="Lovable Generated Project" />
     <meta property="og:type" content="website" />
