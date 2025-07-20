@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import EmbeddedMap from "@/components/map/EmbeddedMap";
+import SimpleEmbeddedMap from "@/components/map/SimpleEmbeddedMap";
 
 export default function Map() {
   return (
@@ -16,7 +16,7 @@ export default function Map() {
           </p>
         </div>
 
-        <EmbeddedMap />
+        <SimpleEmbeddedMap />
       </motion.div>
     </div>
   );

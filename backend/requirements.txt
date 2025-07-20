@@ -11,7 +11,7 @@ pydantic-settings==2.1.0
 supabase==2.3.4
 
 # MAVSDK for drone integration (optional, will gracefully handle if not available)
-mavsdk==1.4.15
+mavsdk==1.4.9
 
 # WebSocket support
 websockets==12.0
@@ -38,3 +38,10 @@ asyncio-mqtt==0.13.0
 
 # Additional utilities
 typing-extensions==4.8.0
+
+# Security and authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Socket.IO for real-time communication
+python-socketio==5.9.0

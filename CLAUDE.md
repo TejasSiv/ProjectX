@@ -149,8 +149,8 @@ uvicorn delivery_planner.main:app --reload
 ```bash
 # Frontend: front/drone-fleet-navigator-main/.env
 VITE_API_BASE_URL=http://localhost:8000    # FastAPI backend URL
-VITE_SUPABASE_URL=your_supabase_url        # Supabase project URL
-VITE_SUPABASE_ANON_KEY=your_anon_key       # Supabase anonymous key
+VITE_SUPABASE_URL=https://liswqdeiydvouikhuuwf.supabase.co    # Supabase project URL
+VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxpc3dxZGVpeWR2b3Vpa2h1dXdmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTAxNzUzODAsImV4cCI6MjA2NTc1MTM4MH0.KMmylVYiwY2F55I0iYscvVAoU1vTXYLtIz5RHDjIUdw      # Supabase anonymous key
 ```
 
 ### Backend Environment Configuration
