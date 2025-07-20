@@ -8,6 +8,8 @@ from .core.config import settings
 from .core.logger import scheduler_logger
 from .mission.mission_runner import mission_runner
 from .mission.telemetry_listener import telemetry_listener
+from .mission.multi_drone_mission_runner import multi_drone_mission_runner
+from .mission.drone_fleet_manager import fleet_manager
 
 
 class OrderScheduler:
@@ -15,8 +17,9 @@ class OrderScheduler:
     
     def __init__(self):
         self.is_running = False
-        self.current_order: Optional[str] = None
+        self.current_orders: dict = {}  # order_id -> drone_id mapping
         self._task: Optional[asyncio.Task] = None
+        self.use_multi_drone = True  # Flag to use multi-drone system
         
     async def start(self):
         """Start the order scheduler."""
@@ -77,9 +80,63 @@ class OrderScheduler:
         scheduler_logger.info("Scheduler loop stopped")
         
     async def _process_pending_orders(self):
-        """Process pending orders."""
+        """Process pending orders using multi-drone system."""
+        if self.use_multi_drone:
+            await self._process_pending_orders_multi_drone()
+        else:
+            await self._process_pending_orders_single_drone()
+            
+    async def _process_pending_orders_multi_drone(self):
+        """Process pending orders with multi-drone fleet."""
+        db = SessionLocal()
+        try:
+            # Get available drone
+            available_drone = fleet_manager.get_available_drone()
+            if not available_drone:
+                return  # No drones available
+                
+            # Get pending orders (can process multiple simultaneously)
+            pending_orders = db.query(DeliveryOrder).filter(
+                DeliveryOrder.status == OrderStatus.PENDING
+            ).order_by(DeliveryOrder.created_at).limit(1).all()  # Process one at a time for now
+            
+            for pending_order in pending_orders:
+                scheduler_logger.info(f"Processing pending order {pending_order.id} with multi-drone system")
+                
+                # Update order status to scheduled
+                pending_order.status = OrderStatus.SCHEDULED
+                pending_order.updated_at = datetime.now(timezone.utc)
+                db.commit()
+                
+                # Execute mission using multi-drone system
+                success = await multi_drone_mission_runner.execute_order_mission(pending_order)
+                
+                if success:
+                    # Track the order
+                    drone_id = fleet_manager.get_drone_for_order(pending_order.id)
+                    if drone_id:
+                        self.current_orders[pending_order.id] = drone_id
+                        
+                    # Update status to in-flight
+                    await self._update_order_status(pending_order.id, OrderStatus.IN_FLIGHT)
+                    
+                    # Monitor mission in background
+                    asyncio.create_task(self._monitor_multi_drone_mission(pending_order.id))
+                else:
+                    await self._handle_mission_failure(pending_order.id, "Failed to start multi-drone mission")
+                    
+                break  # Process one order at a time for now
+                
+        except Exception as e:
+            scheduler_logger.error(f"Error processing pending orders (multi-drone): {str(e)}")
+            db.rollback()
+        finally:
+            db.close()
+            
+    async def _process_pending_orders_single_drone(self):
+        """Process pending orders with single drone (legacy)."""
         # Skip if we're already processing an order
-        if self.current_order:
+        if self.current_orders:
             return
             
         db = SessionLocal()
@@ -140,7 +197,52 @@ class OrderScheduler:
             
         except Exception as e:
             scheduler_logger.error(f"Error executing mission for order {order.id}: {str(e)}")
-            await self._handle_mission_failure(order.id, str(e))
+            await self._handle_mission_failure(order.id, f"Mission execution error: {str(e)}")
+            
+    async def _monitor_multi_drone_mission(self, order_id: str):
+        """Monitor multi-drone mission completion."""
+        try:
+            timeout_minutes = 30
+            timeout_seconds = timeout_minutes * 60
+            start_time = datetime.now(timezone.utc)
+            
+            while order_id in self.current_orders:
+                # Check if mission is still active in multi-drone system
+                active_missions = multi_drone_mission_runner.get_active_missions()
+                
+                if order_id not in active_missions:
+                    # Mission completed or failed
+                    await self._handle_multi_drone_mission_completion(order_id)
+                    break
+                    
+                # Check for timeout
+                elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+                if elapsed > timeout_seconds:
+                    scheduler_logger.warning(f"Multi-drone mission timeout for order {order_id}")
+                    await multi_drone_mission_runner.abort_mission(order_id)
+                    await self._handle_mission_failure(order_id, "Mission timeout")
+                    break
+                    
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+        except Exception as e:
+            scheduler_logger.error(f"Error monitoring multi-drone mission: {str(e)}")
+            await self._handle_mission_failure(order_id, str(e))
+            
+    async def _handle_multi_drone_mission_completion(self, order_id: str):
+        """Handle completion of multi-drone mission."""
+        try:
+            scheduler_logger.info(f"Multi-drone mission completed for order {order_id}")
+            
+            # Update order status
+            await self._update_order_status(order_id, OrderStatus.COMPLETED)
+            
+            # Remove from current orders
+            if order_id in self.current_orders:
+                del self.current_orders[order_id]
+                
+        except Exception as e:
+            scheduler_logger.error(f"Error handling multi-drone mission completion: {str(e)}")
             
     async def _monitor_mission_completion(self, order_id: str):
         """Monitor mission completion and update order status."""
@@ -238,12 +340,26 @@ class OrderScheduler:
         
     def get_status(self) -> dict:
         """Get scheduler status."""
-        return {
-            "is_running": self.is_running,
-            "current_order": self.current_order,
-            "drone_connected": mission_runner.is_connected,
-            "telemetry_active": telemetry_listener.is_listening
-        }
+        if self.use_multi_drone:
+            fleet_stats = fleet_manager.get_fleet_statistics()
+            active_missions = multi_drone_mission_runner.get_active_missions()
+            
+            return {
+                "is_running": self.is_running,
+                "mode": "multi_drone",
+                "current_orders": self.current_orders,
+                "active_missions": len(active_missions),
+                "fleet_status": fleet_stats,
+                "telemetry_active": telemetry_listener.is_listening
+            }
+        else:
+            return {
+                "is_running": self.is_running,
+                "mode": "single_drone",
+                "current_order": getattr(self, 'current_order', None),
+                "drone_connected": mission_runner.is_connected,
+                "telemetry_active": telemetry_listener.is_listening
+            }
 
 
 # Global scheduler instance

@@ -1,96 +1,181 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 import asyncio
-import uvicorn
+import logging
+import structlog
 
-from .core.config import settings
-from .core.database import create_tables
-from .core.logger import main_logger
-from .scheduler import order_scheduler
-from .api.v1.orders import router as orders_router
-from .mission.telemetry_listener import websocket_broadcaster
+# Import core components
+from delivery_planner.core.config import settings
+from delivery_planner.core.database import DatabaseService
+from delivery_planner.core.exceptions import (
+    DroneException, 
+    MissionExecutionError, 
+    ConnectionError as DroneConnectionError
+)
+from delivery_planner.services.order_service import OrderService
+from delivery_planner.services.mission_service import MissionService
+from delivery_planner.services.drone_service import DroneService
+from delivery_planner.scheduler.order_processor import OrderProcessor
 
-app = FastAPI(
-    title="Drone Delivery Mission Planner",
-    description="FastAPI backend for autonomous drone delivery simulation",
-    version="1.0.0"
+# Import API routes
+from delivery_planner.api.v1.orders import router as orders_router
+from delivery_planner.api.v1.missions import router as missions_router
+from delivery_planner.api.v1.telemetry import router as telemetry_router
+from delivery_planner.api.v1.health import router as health_router
+
+# Configure logging
+logging.basicConfig(level=getattr(logging, settings.log_level))
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.JSONRenderer()
+    ],
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
 )
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logger = structlog.get_logger()
 
-# Include API routers
-app.include_router(orders_router, prefix="/api/v1")
+# Global service instances
+db_service = None
+order_service = None
+mission_service = None
+drone_service = None
+order_processor = None
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application on startup."""
-    main_logger.info("Starting Drone Delivery Mission Planner")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    global db_service, order_service, mission_service, drone_service, order_processor
     
-    # Create database tables
-    create_tables()
-    main_logger.info("Database tables created")
-    
-    # Start the order scheduler
-    await order_scheduler.start()
-    main_logger.info("Order scheduler started")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    main_logger.info("Shutting down Drone Delivery Mission Planner")
-    
-    # Stop the order scheduler
-    await order_scheduler.stop()
-    main_logger.info("Order scheduler stopped")
-
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "message": "Drone Delivery Mission Planner API",
-        "version": "1.0.0",
-        "status": "running"
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    scheduler_status = order_scheduler.get_status()
-    
-    return {
-        "status": "healthy",
-        "timestamp": "2025-01-01T00:00:00Z",
-        "scheduler": scheduler_status
-    }
-
-@app.websocket("/ws/telemetry")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time telemetry updates."""
-    await websocket.accept()
-    websocket_broadcaster.add_connection(websocket)
+    # Startup
+    logger.info("Starting Drone Fleet Navigator Backend")
     
     try:
-        # Keep connection alive
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        websocket_broadcaster.remove_connection(websocket)
+        # Initialize services
+        db_service = DatabaseService()
+        order_service = OrderService(db_service)
+        mission_service = MissionService(db_service)
+        drone_service = DroneService()
+        
+        # Health check database
+        await db_service.health_check()
+        
+        # Connect to drone (simulation mode for development)
+        if settings.debug_mode:
+            await drone_service.connect_to_drone()
+        
+        # Initialize order processor
+        order_processor = OrderProcessor(order_service, mission_service, drone_service)
+        await order_processor.start()
+        
+        # Store services in app state
+        app.state.db_service = db_service
+        app.state.order_service = order_service
+        app.state.mission_service = mission_service
+        app.state.drone_service = drone_service
+        app.state.order_processor = order_processor
+        
+        logger.info("All services initialized successfully")
+        
     except Exception as e:
-        main_logger.error(f"WebSocket error: {str(e)}")
-        websocket_broadcaster.remove_connection(websocket)
+        logger.error(f"Failed to initialize services: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down Drone Fleet Navigator Backend")
+    
+    try:
+        if order_processor:
+            await order_processor.stop()
+        if drone_service:
+            await drone_service.disconnect()
+        logger.info("Services shut down successfully")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "delivery_planner.main:app",
-        host=settings.api_host,
-        port=settings.api_port,
-        reload=True,
-        log_level=settings.log_level.lower()
-    ) 
+# Create FastAPI application
+app = FastAPI(
+    title=settings.app_title,
+    description=settings.app_description,
+    version=settings.app_version,
+    lifespan=lifespan
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    allow_credentials=True,
+    allow_methods=settings.allowed_methods,
+    allow_headers=settings.allowed_headers,
+)
+
+# Exception handlers
+@app.exception_handler(DroneException)
+async def drone_exception_handler(request, exc):
+    logger.error(f"Drone operation failed: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Drone operation failed: {str(exc)}"}
+    )
+
+@app.exception_handler(MissionExecutionError)
+async def mission_execution_error_handler(request, exc):
+    logger.error(f"Mission execution failed: {exc}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": f"Mission execution failed: {str(exc)}"}
+    )
+
+@app.exception_handler(DroneConnectionError)
+async def connection_error_handler(request, exc):
+    logger.error(f"Drone connection error: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"Drone connection error: {str(exc)}"}
+    )
+
+# Include API routers
+app.include_router(
+    orders_router, 
+    prefix=f"{settings.api_v1_prefix}/orders",
+    tags=["orders"]
+)
+
+app.include_router(
+    missions_router,
+    prefix=f"{settings.api_v1_prefix}/missions", 
+    tags=["missions"]
+)
+
+app.include_router(
+    telemetry_router,
+    prefix=f"{settings.api_v1_prefix}/telemetry",
+    tags=["telemetry"]
+)
+
+app.include_router(
+    health_router,
+    prefix="",
+    tags=["health"]
+)
+
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Drone Fleet Navigator Backend API",
+        "version": settings.app_version,
+        "docs_url": "/docs",
+        "health_url": "/health"
+    } 

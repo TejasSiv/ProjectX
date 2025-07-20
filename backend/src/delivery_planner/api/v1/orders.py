@@ -1,279 +1,207 @@
-from fastapi import APIRouter, HTTPException, Query, status
-from typing import Optional, List, Dict, Any
-import math
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from typing import List, Optional
 import uuid
+import logging
 
-from ...core.supabase_client import supabase_client
-from ...core.schemas import (
-    OrderCreate, OrderUpdate, OrderResponse, OrderListResponse, ErrorResponse, OrderStatus
+from ...core.exceptions import OrderNotFoundError, ValidationError
+from ...models.orders import (
+    OrderCreateRequest,
+    OrderUpdateRequest, 
+    OrderResponse,
+    OrderStatus,
+    OrderStatsResponse,
+    OrderListResponse
 )
-from ...core.logger import api_logger
+from ...services.order_service import OrderService
 
-router = APIRouter(prefix="/orders", tags=["orders"])
+logger = logging.getLogger(__name__)
+router = APIRouter()
 
-
-def calculate_distance(coords1: List[float], coords2: List[float]) -> float:
-    """Calculate distance between two coordinates using Haversine formula."""
-    lat1, lon1 = coords1
-    lat2, lon2 = coords2
-    
-    R = 6371  # Earth's radius in kilometers
-    
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    
-    a = (math.sin(dlat/2) * math.sin(dlat/2) + 
-         math.cos(lat1_rad) * math.cos(lat2_rad) * 
-         math.sin(dlon/2) * math.sin(dlon/2))
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    
-    return R * c
-
-
-def estimate_delivery_time(pickup_coords: List[float], dropoff_coords: List[float]) -> int:
-    """Estimate delivery time based on distance."""
-    distance_km = calculate_distance(pickup_coords, dropoff_coords)
-    
-    # Assume average drone speed of 30 km/h, add 5 minutes for takeoff/landing
-    flight_time_minutes = (distance_km / 30) * 60
-    total_time = flight_time_minutes + 5
-    
-    return max(10, int(total_time))  # Minimum 10 minutes
-
-
-def transform_supabase_order(order_data: Dict[str, Any]) -> OrderResponse:
-    """Transform Supabase order data to OrderResponse format."""
-    return OrderResponse(
-        id=order_data["id"],
-        customer_id=order_data["customer_id"],
-        pickup_coords=order_data["pickup_coords"],
-        dropoff_coords=order_data["dropoff_coords"],
-        status=order_data["status"],
-        created_at=order_data["created_at"],
-        updated_at=order_data["updated_at"],
-        estimated_time=order_data.get("estimated_time")
-    )
-
+def get_order_service() -> OrderService:
+    """Dependency to get order service from app state"""
+    from ...main import app
+    return app.state.order_service
 
 @router.post("/", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
-async def create_order(order: OrderCreate):
-    """Create a new delivery order via FastAPI backend."""
+async def create_order(
+    order_data: OrderCreateRequest,
+    service: OrderService = Depends(get_order_service)
+):
+    """Create a new delivery order"""
     try:
-        # Calculate estimated delivery time
-        estimated_time = estimate_delivery_time(order.pickup_coords, order.dropoff_coords)
-        
-        # Create order data for Supabase
-        order_data = {
-            "id": f"DRN-{str(uuid.uuid4())[:8].upper()}",
-            "customer_id": order.customer_id,
-            "pickup_coords": order.pickup_coords,
-            "dropoff_coords": order.dropoff_coords,
-            "estimated_time": estimated_time,
-            "status": OrderStatus.PENDING.value
-        }
-        
-        # Create order in Supabase
-        order_id = await supabase_client.create_order(order_data)
-        
-        if not order_id:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create order in database"
-            )
-        
-        # Fetch the created order
-        created_order = await supabase_client.get_order_by_id(order_id)
-        
-        if not created_order:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve created order"
-            )
-        
-        api_logger.info(f"Created order {order_id} for customer {order.customer_id}")
-        return transform_supabase_order(created_order)
-        
-    except HTTPException:
-        raise
+        order = await service.create_order(order_data)
+        logger.info(f"Created order {order.id} for customer {order.customer_id}")
+        return order
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        api_logger.error(f"Error creating order: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create order"
-        )
-
+        logger.error(f"Failed to create order: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create order")
 
 @router.get("/", response_model=OrderListResponse)
-async def list_orders(
-    status_filter: Optional[OrderStatus] = Query(None, description="Filter by order status"),
-    customer_id: Optional[str] = Query(None, description="Filter by customer ID"),
-    page: int = Query(1, ge=1, description="Page number"),
-    size: int = Query(10, ge=1, le=100, description="Page size")
+async def get_orders(
+    status: Optional[OrderStatus] = Query(None, description="Filter by order status"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of orders to return"),
+    offset: int = Query(0, ge=0, description="Number of orders to skip"),
+    service: OrderService = Depends(get_order_service)
 ):
-    """List orders with optional filtering and pagination from Supabase."""
+    """Get list of orders with optional filtering"""
     try:
-        # Get orders from Supabase
-        orders_data = await supabase_client.get_orders(
-            status=status_filter.value if status_filter else None
-        )
+        orders = await service.get_orders(status=status, limit=limit, offset=offset)
         
-        # Apply customer filter if provided
-        if customer_id:
-            orders_data = [order for order in orders_data if order.get("customer_id") == customer_id]
-        
-        # Apply pagination
-        total = len(orders_data)
-        offset = (page - 1) * size
-        paginated_orders = orders_data[offset:offset + size]
-        
-        # Transform to response format
-        orders = [transform_supabase_order(order) for order in paginated_orders]
+        # Get total count for pagination (simplified - in production, use efficient count query)
+        total_orders = await service.get_orders(limit=10000)  # Get all for count
+        total = len(total_orders)
+        has_more = offset + limit < total
         
         return OrderListResponse(
             orders=orders,
             total=total,
-            page=page,
-            size=size
+            offset=offset,
+            limit=limit,
+            has_more=has_more
         )
-        
     except Exception as e:
-        api_logger.error(f"Error listing orders: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to list orders"
-        )
-
+        logger.error(f"Failed to get orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve orders")
 
 @router.get("/{order_id}", response_model=OrderResponse)
-async def get_order(order_id: str):
-    """Get a specific order by ID from Supabase."""
+async def get_order(
+    order_id: uuid.UUID,
+    service: OrderService = Depends(get_order_service)
+):
+    """Get a specific order by ID"""
     try:
-        order_data = await supabase_client.get_order_by_id(order_id)
-        
-        if not order_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Order {order_id} not found"
-            )
-        
-        return transform_supabase_order(order_data)
-        
-    except HTTPException:
-        raise
+        return await service.get_order(order_id)
+    except OrderNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
     except Exception as e:
-        api_logger.error(f"Error getting order {order_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to get order"
-        )
-
+        logger.error(f"Failed to get order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve order")
 
 @router.put("/{order_id}", response_model=OrderResponse)
 async def update_order(
-    order_id: str, 
-    order_update: OrderUpdate, 
-    db: Session = Depends(get_db)
+    order_id: uuid.UUID,
+    update_data: OrderUpdateRequest,
+    service: OrderService = Depends(get_order_service)
 ):
-    """Update an existing order."""
+    """Update an existing order"""
     try:
-        order = db.query(DeliveryOrder).filter(DeliveryOrder.id == order_id).first()
-        
-        if not order:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Order {order_id} not found"
-            )
-        
-        # Update fields that are provided
-        update_data = order_update.dict(exclude_unset=True)
-        for field, value in update_data.items():
-            setattr(order, field, value)
-        
-        # Recalculate estimated time if coordinates changed
-        if any(field in update_data for field in ['pickup_lat', 'pickup_lon', 'dropoff_lat', 'dropoff_lon']):
-            order.estimated_time = estimate_delivery_time(
-                order.pickup_lat, order.pickup_lon,
-                order.dropoff_lat, order.dropoff_lon
-            )
-        
-        db.commit()
-        db.refresh(order)
-        
-        api_logger.info(f"Updated order {order_id}")
-        return order
-        
-    except HTTPException:
-        raise
+        return await service.update_order(order_id, update_data)
+    except OrderNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        api_logger.error(f"Error updating order {order_id}: {str(e)}")
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update order"
-        )
-
+        logger.error(f"Failed to update order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update order")
 
 @router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_order(order_id: str, db: Session = Depends(get_db)):
-    """Delete an order."""
-    try:
-        order = db.query(DeliveryOrder).filter(DeliveryOrder.id == order_id).first()
-        
-        if not order:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Order {order_id} not found"
-            )
-        
-        db.delete(order)
-        db.commit()
-        
-        api_logger.info(f"Deleted order {order_id}")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        api_logger.error(f"Error deleting order {order_id}: {str(e)}")
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete order"
-        )
-
-
-@router.patch("/{order_id}/status", response_model=OrderResponse)
-async def update_order_status(
-    order_id: str, 
-    new_status: OrderStatus,
-    db: Session = Depends(get_db)
+async def delete_order(
+    order_id: uuid.UUID,
+    service: OrderService = Depends(get_order_service)
 ):
-    """Update only the status of an order."""
+    """Delete an order"""
     try:
-        order = db.query(DeliveryOrder).filter(DeliveryOrder.id == order_id).first()
-        
-        if not order:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Order {order_id} not found"
-            )
-        
-        old_status = order.status
-        order.status = new_status
-        
-        db.commit()
-        db.refresh(order)
-        
-        api_logger.info(f"Updated order {order_id} status from {old_status} to {new_status}")
-        return order
-        
-    except HTTPException:
-        raise
+        success = await service.delete_order(order_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    except OrderNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        api_logger.error(f"Error updating order {order_id} status: {str(e)}")
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update order status"
-        )
+        logger.error(f"Failed to delete order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete order")
+
+@router.post("/{order_id}/start", response_model=OrderResponse)
+async def start_order(
+    order_id: uuid.UUID,
+    service: OrderService = Depends(get_order_service)
+):
+    """Start order execution (transition to scheduled status)"""
+    try:
+        return await service.start_order(order_id)
+    except OrderNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to start order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to start order")
+
+@router.post("/{order_id}/abort", response_model=OrderResponse)
+async def abort_order(
+    order_id: uuid.UUID,
+    reason: str = Query("Aborted by user", description="Reason for aborting order"),
+    service: OrderService = Depends(get_order_service)
+):
+    """Abort order execution"""
+    try:
+        return await service.abort_order(order_id, reason)
+    except OrderNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to abort order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to abort order")
+
+@router.get("/{order_id}/eta")
+async def get_order_eta(
+    order_id: uuid.UUID,
+    service: OrderService = Depends(get_order_service)
+):
+    """Get estimated time of arrival for an order"""
+    try:
+        eta = await service.calculate_eta(order_id)
+        return {"order_id": order_id, "eta_minutes": eta}
+    except OrderNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    except Exception as e:
+        logger.error(f"Failed to calculate ETA for order {order_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to calculate ETA")
+
+@router.get("/stats/summary", response_model=OrderStatsResponse)
+async def get_order_statistics(
+    service: OrderService = Depends(get_order_service)
+):
+    """Get comprehensive order statistics"""
+    try:
+        return await service.get_order_stats()
+    except Exception as e:
+        logger.error(f"Failed to get order statistics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve statistics")
+
+@router.get("/stats/performance")
+async def get_performance_metrics(
+    service: OrderService = Depends(get_order_service)
+):
+    """Get delivery performance metrics"""
+    try:
+        return await service.get_delivery_performance_metrics()
+    except Exception as e:
+        logger.error(f"Failed to get performance metrics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
+
+@router.get("/active/list", response_model=List[OrderResponse])
+async def get_active_orders(
+    service: OrderService = Depends(get_order_service)
+):
+    """Get all active orders (scheduled or in-flight)"""
+    try:
+        return await service.get_active_orders()
+    except Exception as e:
+        logger.error(f"Failed to get active orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve active orders")
+
+@router.get("/overdue/list", response_model=List[OrderResponse])
+async def get_overdue_orders(
+    service: OrderService = Depends(get_order_service)
+):
+    """Get orders that are overdue"""
+    try:
+        return await service.get_overdue_orders()
+    except Exception as e:
+        logger.error(f"Failed to get overdue orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve overdue orders")
